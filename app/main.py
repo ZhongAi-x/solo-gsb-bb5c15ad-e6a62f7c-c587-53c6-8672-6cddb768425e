@@ -31,6 +31,13 @@ class EventIn(BaseModel):
     expires_at: AwareDatetime | None = None
 
 
+class TargetPauseIn(BaseModel):
+    # Validated and normalised with the exact same HttpUrl rule as event
+    # creation, so a pause matches the canonical target stored on events.
+    target: HttpUrl
+    paused: bool
+
+
 # In-memory counters for the built-in demo sink (not part of the core API).
 _sink_lock = threading.Lock()
 _sink_calls: dict[str, int] = {}
@@ -82,9 +89,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Reliable Webhook Delivery API",
-    version="1.4.0",
+    version="1.5.0",
     description="Sign, enqueue, reliably deliver, replay and inspect webhook events, "
-    "with persistent per-target circuit breakers.",
+    "with persistent per-target circuit breakers and maintenance pauses.",
     lifespan=lifespan,
 )
 
@@ -339,6 +346,57 @@ async def get_target_breakers(
     """
     breakers = db.list_breakers(state=state, target=target, limit=limit, offset=offset)
     return {"breakers": breakers, "limit": limit, "offset": offset}
+
+
+@app.put("/targets/pause")
+async def set_target_pause(request: Request) -> dict:
+    """Pause or resume delivery to one target endpoint (maintenance switch).
+
+    Body: ``{"target": "<http/https URL>", "paused": <bool>}``. The target
+    is canonicalised with the same URL rule as ``POST /events`` and matched
+    exactly; setting the same value repeatedly is idempotent.
+
+    While paused the scheduler claims no further events for the target —
+    the pause commit and event claims are serialised in SQLite transactions,
+    so a committed pause takes effect before the very next claim — but an
+    attempt already in flight completes normally, other targets deliver
+    unaffected and queued events that pass their ``expires_at`` are still
+    swept to ``expired``. Resuming only clears the flag: head order,
+    scheduled times, backoff, attempt counts and breaker state are all
+    preserved. The setting persists in SQLite across restarts.
+    """
+    raw_body = await request.body()
+    try:
+        data = json.loads(raw_body) if raw_body else None
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="request body must be JSON")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="request body must be a JSON object")
+    try:
+        pause_in = TargetPauseIn(**data)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors())
+    return db.set_target_paused(str(pause_in.target), pause_in.paused)
+
+
+@app.get("/targets/pauses")
+async def get_target_pauses(
+    target: str | None = Query(None, description="Filter by exact target URL."),
+    paused: bool | None = Query(None, description="Filter by pause state."),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """Report configured per-target maintenance switches.
+
+    Every target ever set with ``PUT /targets/pause`` is returned (paused
+    and resumed), with its current ``paused`` flag and the RFC 3339 UTC
+    ``updated_at`` of the last setting. State is read straight from SQLite,
+    so pauses set before a restart are still listed afterwards.
+    """
+    rows = db.list_target_pauses(
+        target=target, paused=paused, limit=limit, offset=offset
+    )
+    return {"pauses": rows, "limit": limit, "offset": offset}
 
 
 @app.get("/health")

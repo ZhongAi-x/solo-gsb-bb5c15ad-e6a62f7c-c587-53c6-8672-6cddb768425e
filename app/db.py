@@ -46,6 +46,14 @@ TERMINAL_STATUSES = ("delivered", "dead", "expired")
 # restart keeps the deadline counting instead of resetting it.
 
 
+# Per-target maintenance pause (independent of the circuit breaker):
+# a paused row means an operator has put the endpoint into maintenance; the
+# scheduler never claims *new* events for that target while paused, but an
+# already ``processing`` (claimed) attempt is never interrupted and queued
+# events whose ``expires_at`` passes are still swept to ``expired``. Resuming
+# only clears the flag — head ordering, ``deliver_after``/backoff timers,
+# attempt counts and breaker state are all left untouched. Pauses persist in
+# the ``target_pauses`` table, so they survive restarts.
 class ReplayNotAllowedError(Exception):
     """Raised when a replay is requested for an event that is not dead."""
 
@@ -123,6 +131,12 @@ def init_db() -> None:
                 consecutive_failures INTEGER NOT NULL DEFAULT 0,
                 open_until_ts        REAL,
                 probe_event_id       TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS target_pauses (
+                target     TEXT PRIMARY KEY,
+                paused     INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_events_status
@@ -375,6 +389,13 @@ def claim_due_events() -> list[dict]:
        claimed and the breaker atomically flips to ``half-open`` with that
        event recorded as its probe. Different targets stay independent, so
        a breaker on one endpoint never blocks anyone else.
+    4. A target under a maintenance pause (a row in ``target_pauses``) is
+       never claimed, independently of its breaker state. This check runs
+       inside the same transaction and under the same lock as the pause
+       setter, so once a pause is committed no later claim can pick that
+       target. Already-claimed (``processing``) events are unaffected and
+       their in-flight requests complete normally, and the expiry sweep in
+       step 1 runs regardless of pause.
     """
     now = time.time()
     with db_lock:
@@ -389,8 +410,10 @@ def claim_due_events() -> list[dict]:
             """
             SELECT e.* FROM events e
             LEFT JOIN breakers b ON b.target = e.target
+            LEFT JOIN target_pauses p ON p.target = e.target
             WHERE e.status = 'queued'
               AND e.next_attempt_at <= ?
+              AND (p.target IS NULL OR p.paused = 0)
               AND (
                     b.target IS NULL
                     OR b.state = 'closed'
@@ -700,3 +723,77 @@ def list_breakers(
             (*params, limit, offset),
         ).fetchall()
         return [_hydrate_breaker(r) for r in rows]
+
+
+def set_target_paused(target: str, paused: bool) -> dict:
+    """Set a target's maintenance pause flag (idempotent upsert).
+
+    The target key is normalised by the API layer with exactly the same
+    pydantic ``HttpUrl`` rule used when events are created, so a pause set
+    on one spelling of a URL matches the events stored under the canonical
+    spelling. Repeating the same setting simply refreshes ``updated_at`` and
+    changes nothing else.
+
+    The upsert commits under the same ``db_lock`` and in the same kind of
+    single transaction as :func:`claim_due_events`: after a ``paused=1``
+    commit returns, every subsequent claim transaction observes the row and
+    can no longer pick that target, while an already-claimed attempt keeps
+    running to completion. Resuming (``paused=0``) only clears the flag —
+    head ordering, backoff/``deliver_after`` timers, attempt counts and
+    breaker state are never touched.
+    """
+    with db_lock:
+        conn = get_conn()
+        conn.execute(
+            "INSERT INTO target_pauses (target, paused, updated_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(target) DO UPDATE SET paused = excluded.paused, "
+            "updated_at = excluded.updated_at",
+            (target, 1 if paused else 0, _iso()),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM target_pauses WHERE target = ?", (target,)
+        ).fetchone()
+        return _hydrate_pause(row)
+
+
+def _hydrate_pause(row: sqlite3.Row) -> dict:
+    return {
+        "target": row["target"],
+        "paused": bool(row["paused"]),
+        "updated_at": row["updated_at"],
+    }
+
+
+def list_target_pauses(
+    target: str | None = None,
+    paused: bool | None = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> list[dict]:
+    """Return configured pause rows, optionally filtered by exact target.
+
+    Every target ever set through ``PUT /targets/pause`` appears once, even
+    after it has been resumed (``paused=false``), so the response reflects
+    all configured maintenance switches rather than only currently-paused
+    endpoints.
+    """
+    limit = max(1, min(limit, 500))
+    clauses: list[str] = []
+    params: list = []
+    if target:
+        clauses.append("target = ?")
+        params.append(target)
+    if paused is not None:
+        clauses.append("paused = ?")
+        params.append(1 if paused else 0)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with db_lock:
+        conn = get_conn()
+        rows = conn.execute(
+            f"SELECT * FROM target_pauses {where} ORDER BY target "
+            "LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+        return [_hydrate_pause(r) for r in rows]
