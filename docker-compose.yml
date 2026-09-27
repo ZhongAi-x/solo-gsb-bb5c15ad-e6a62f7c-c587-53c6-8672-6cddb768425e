@@ -15,10 +15,11 @@ services:
       BREAKER_FAILURE_THRESHOLD: "${BREAKER_FAILURE_THRESHOLD:-3}"
       BREAKER_OPEN_SECONDS: "${BREAKER_OPEN_SECONDS:-10}"
     volumes:
-      # Persists events, delivery attempts, dead-letter/replay state and
-      # per-target breaker state (state, failure count, open deadline).
-      # Older databases are migrated in place on startup — the replay and
-      # delivery-window columns and the breakers table are added
+      # Persists events, delivery attempts, dead-letter/replay state,
+      # per-target breaker state (state, failure count, open deadline) and
+      # per-target maintenance pauses (PUT /targets/pause). Older databases
+      # are migrated in place on startup — the replay and delivery-window
+      # columns and the breakers/target_pauses tables are created
       # automatically.
       - webhook-data:/data
     restart: unless-stopped

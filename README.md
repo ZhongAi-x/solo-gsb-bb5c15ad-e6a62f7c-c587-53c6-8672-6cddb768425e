@@ -6,6 +6,8 @@
 三次重试仍失败则进入死信。支持 **投递时间窗**（`deliver_after` / `expires_at`）：
 可预约首次投递时刻，也可为排队等待设置截止期限。每个目标端点还带有**自动熔断器**：
 连续 3 次投递失败即熔断 10 秒，到期后仅放行队头事件作为唯一 half-open 探针。
+此外可为任意目标设置**维护开关**（`PUT /targets/pause`）：暂停后不再领取该目标的
+新事件、其他目标照常投递，恢复时不重置任何退避/熔断/尝试状态。
 技术栈：**Python · FastAPI · SQLite**。
 
 ## 特性
@@ -18,6 +20,7 @@
 - **重试与死信**：首次立即投递（或按 `deliver_after` 延迟）；失败后分别等待 **1s / 2s / 4s** 重试（共 4 次尝试）；第 4 次仍失败（非 2xx、超时、连接错误）即进入死信（状态 `dead`）。
 - **按目标端点的自动熔断器**：同一目标**连续 3 次**投递失败（非 2xx、超时、连接错误）后进入 **open**，10 秒内该目标的任何事件都不会被领取；熔断到期**且队头事件已到原定投递时间**（退避/`deliver_after`）时，只允许该队头事件作为唯一的 **half-open 探针**领取，其余事件继续排队。探针返回 2xx → 熔断 **closed**、连续失败计数清零；探针失败 → 重新 open 10 秒（计数继续累计）。熔断**只影响出问题的目标**，其他端点照常并行投递。状态（`closed`/`open`/`half-open`）、连续失败数、截止时间与探针事件 id 全部持久化在 SQLite，**重启后继续生效**，并与队头顺序、1/2/4 退避、过期清扫和死信重放完全兼容。
 - **熔断器查询**：`GET /targets/breakers` 返回每个有过投递尝试的目标的当前状态、`consecutive_failures`、open 截止时间（`open_until`，RFC 3339 UTC）与 half-open 探针事件 id（`probe_event_id`），支持按 `state` / `target` 过滤。
+- **目标维护开关**：`PUT /targets/pause`（请求体 `{"target": <URL>, "paused": <bool>}`）按与入站事件**相同的目标 URL 规范化**精确匹配目标，重复设置幂等；`GET /targets/pauses` 返回所有已设置目标及其暂停状态。暂停后调度器**不再领取**该目标的新事件，**已领取（`processing`）的在途请求正常完成**，**其他目标照常投递**；暂停期间排队事件**仍按 `expires_at` 正常清扫过期**。恢复只解除暂停：队头顺序、预约时间、1/2/4 退避与熔断（open 截止时间、失败计数、half-open 探针）一律保持，**不重置尝试次数或熔断状态**。开关写入与调度领取在同一把数据库锁的串行事务中生效，状态保存在 SQLite `target_pauses` 表，**重启后保留**，老库启动自动建表。
 - **死信重放**：`POST /events/{event_id}/replay` 仅接受 `dead` 事件，在一个事务内将其重新入队并开启**新一轮完整**的 1s/2s/4s 退避（再次享有 4 次尝试）。历史 `attempts` 全部保留、`attempt_no` 连续递增，`replay_count` 累计并记录 `last_replayed_at`，幂等键与事件 id 不变；并发重复重放只会生效一次，不会重复投递。
 - **事件查询**：返回每次尝试的时间、HTTP 响应码/错误信息、最终状态（`queued` / `processing` / `delivered` / `dead` / `expired`），时间窗字段 `deliver_after` / `expires_at`，以及 `replay_count` / `last_replayed_at` 重放信息。
 - **崩溃恢复**：投递状态全部在 SQLite（WAL 模式）中，重启后把卡在 `processing` 的事件重新排队；出站请求携带 `X-Event-Id` / `X-Idempotency-Key`，投递语义为 at-least-once。
@@ -39,9 +42,9 @@ docker compose up --build
 | OpenAPI Schema | <http://localhost:8000/openapi.json> |
 
 宿主机端口 `8000`，容器内端口 `8000`（在 `docker-compose.yml` 的 `ports` 中可改）。
-数据（事件、投递尝试、死信与重放记录、熔断器状态）持久化在命名卷 `webhook-data`（容器内
-`/data/webhooks.db`）；老版本数据库启动时会自动补齐重放、时间窗相关列以及熔断器表，
-无需手工迁移。
+数据（事件、投递尝试、死信与重放记录、熔断器状态、目标暂停开关）持久化在命名卷
+`webhook-data`（容器内 `/data/webhooks.db`）；老版本数据库启动时会自动补齐重放、
+时间窗相关列以及熔断器表、目标暂停表，无需手工迁移。
 
 生产环境请覆盖默认密钥：
 
@@ -134,6 +137,7 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
 - `GET /events/key/{idempotency_key}` — 按幂等键查询
 - `GET /events?status=dead&limit=50&offset=0` — 列表，可按状态过滤（`queued` / `processing` / `delivered` / `dead` / `expired`）
 - `GET /targets/breakers?state=open&target=<url>&limit=200&offset=0` — 查询各目标端点的熔断器（见下节）
+- `GET /targets/pauses?target=<url>&paused=true` — 查询各目标端点的维护开关（见第 6 节）
 
 响应示例（4 次尝试后进入死信）：
 
@@ -240,6 +244,69 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
 
 熔断与既有机制的关系：熔断器叠加在事件状态机之上，不改变单次事件的 1/2/4 退避与死信规则——若探针恰好是该轮第 4 次失败，事件照常进入死信（随后可重放），而熔断器同步重新 open；`queued` 事件在 open 期间到达 `expires_at` 仍会正常转为 `expired` 并让位；重放死信事件时若熔断仍 open，事件会排队等到可探针为止。
 
+### 6. 目标维护开关
+
+为单个目标端点暂停/恢复投递，用于目标侧维护。开关状态持久化在 SQLite `target_pauses`
+表，重启后保留；老数据库启动时 `CREATE TABLE IF NOT EXISTS` 自动建表，无需手工迁移。
+
+#### `PUT /targets/pause`
+
+请求体：
+
+```json
+{"target": "http://example.com/hooks", "paused": true}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `target` | 必填，目标 URL（http/https）；按与 `POST /events` **相同的规则规范化**（scheme/host 小写、默认端口省略、路径归一），与事件库里保存的目标串精确匹配 |
+| `paused` | 必填，布尔：`true` 暂停投递，`false` 恢复 |
+
+响应 `200`：
+
+```json
+{
+  "target": "http://example.com/hooks",
+  "paused": true,
+  "updated_at": "2026-09-27T12:27:13.160640+00:00"
+}
+```
+
+- 重复设置相同值是**幂等**的：行内容（含 `updated_at`）不变；从暂停改为恢复（或反向）才刷新 `updated_at`。
+- 字段缺失/类型不对、目标不是合法 URL → `422`。该接口不需要签名（运维管理面）。
+
+暂停/恢复与调度器领取的串行语义：开关写入与 `claim_due_events` 领取都在同一把数据库锁
+（`db_lock`）保护的单条 SQLite 事务中，因此二者严格串行：
+
+1. **暂停提交后**，后续领取事务不再取出该目标的任何 `queued` 事件（其他目标不受影响、照常并行投递）；
+2. **暂停前已领取**（状态 `processing`）的事件**不会被中断**，在途 HTTP 请求正常完成并照常进入 `delivered` / 重试 / 死信流程；
+3. 暂停期间排队事件**继续按 `expires_at` 清扫**：到期仍为 `queued` 的事件转为 `expired`（零尝试）并解除对同目标后续事件的阻塞；
+4. **恢复仅解除暂停**：之后的领取仍遵守原有的队头顺序、`deliver_after` 预约时间、1/2/4 退避和熔断条件（open 截止时间继续倒计时、half-open 探针规则不变），**尝试次数、退避进度与熔断状态均不重置**。
+
+#### `GET /targets/pauses`
+
+返回所有**显式设置过**开关的目标（从未设置的目标不出现在列表中，行为等同未暂停）：
+
+| 参数 | 说明 |
+| --- | --- |
+| `target` | 可选，按规范化后的完整目标 URL 精确匹配 |
+| `paused` | 可选，`true` / `false`，仅返回暂停中/已恢复的行 |
+| `limit` / `offset` | 可选，分页（`limit` 1–500，默认 200） |
+
+```json
+{
+  "pauses": [
+    {
+      "target": "http://example.com/hooks",
+      "paused": true,
+      "updated_at": "2026-09-27T12:27:13.160640+00:00"
+    }
+  ],
+  "limit": 200,
+  "offset": 0
+}
+```
+
 ### 出站投递格式
 
 服务向 `target` 发送 `POST`（`Content-Type: application/json`），请求体：
@@ -289,6 +356,14 @@ curl -s -X POST "$BASE/events/$DEAD_ID/replay"
 # 观察按目标熔断器：上面连续失败的目标会经历 open（10s）→ half-open（单探针）→ closed
 curl -s "$BASE/targets/breakers"                 # 全部目标
 curl -s "$BASE/targets/breakers?state=open"     # 只看熔断中的目标
+
+# 目标维护开关：暂停某目标（无需签名），该目标不再被领取，其他目标照常投递
+curl -s -X PUT "$BASE/targets/pause" -H 'Content-Type: application/json' \
+  -d "{\"target\":\"$BASE/dev/sink\",\"paused\":true}"
+curl -s "$BASE/targets/pauses"                  # 查看所有已设置开关
+# 恢复：只解除暂停，退避/尝试次数/熔断状态全部保持原样
+curl -s -X PUT "$BASE/targets/pause" -H 'Content-Type: application/json' \
+  -d "{\"target\":\"$BASE/dev/sink\",\"paused\":false}"
 ```
 
 Python 生成签名：
@@ -352,6 +427,18 @@ signature = "sha256=" + hmac.new(
 `reset_stuck_events` 保留普通 open 行的截止时间，只把卡在 half-open 的行改为
 **已到期**的 open（探针事件同时重新排队），使该目标下一个 tick 即可重新探针。
 
+维护开关实现要点：`target_pauses` 表（`target` 主键，`paused` 0/1，`updated_at`）
+由 `init_db` 以 `CREATE TABLE IF NOT EXISTS` 创建，老库启动即自动获得，状态持久化
+且重启保留。`PUT /targets/pause` 复用与入站事件同一个 `HttpUrl` 规范化（`str(HttpUrl)`），
+保证按事件库里保存的目标串精确匹配；upsert 时若行已存在且标志相同则原样返回，
+`updated_at` 不变（重复设置幂等）。领取事件的同一事务额外 `LEFT JOIN target_pauses`
+门控：`paused = 1` 的目标不参与领取，但领取事务**开头的过期清扫不看该标志**，
+所以暂停期间排队事件照常到期转 `expired`。开关写入与领取都在 `db_lock` 保护的单条
+事务内，二者严格串行：已提交的暂停对下一个领取事务立即生效；先提交的领取不会被回滚，
+其事件留在 `processing` 由 worker 正常完成。恢复只是 upsert 回 `paused = 0`，
+不触碰 `events` / `breakers` 的任何字段，因此队头顺序、`next_attempt_at`（退避与
+预约时间）、尝试计数与熔断状态全部保持，恢复后按原状态机继续。
+
 ## 运行测试
 
 ```bash
@@ -369,16 +456,20 @@ python -m pytest tests/ -v
 任一新事件非法时整批回滚、重发同批不重复投递、批量事件排在既有队头之后），
 以及按目标熔断器（连续 3 次失败 open、open 期间全目标冻结、到期仅队头作为 half-open
 探针、探针成功 closed 清零/失败重新 open、其他目标并行不受影响、查询接口字段与过滤、
-重启后 open 截止时间保持且崩溃中断的探针自动恢复、默认阈值 3 次/10 秒）。
+重启后 open 截止时间保持且崩溃中断的探针自动恢复、默认阈值 3 次/10 秒），
+以及目标维护开关（URL 规范化精确匹配与重复设置幂等、暂停后不再领取而其他目标照常投递、
+在途请求正常完成、暂停/恢复不重置尝试计数与 1/2/4 退避、熔断 open 截止/计数/探针保持、
+暂停期间排队事件照常过期清扫、恢复后按原队头顺序投递、开关写入与领取在数据库事务中
+串行生效、老库自动建表且暂停状态跨重启保留）。
 
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：签名校验、单事件/批量接收、查询、死信重放、熔断器查询、dev sink
+│   ├── main.py        # FastAPI 路由：签名校验、单事件/批量接收、查询、死信重放、熔断器查询、目标维护开关、dev sink
 │   ├── config.py      # 环境变量配置（含熔断阈值/open 时长）
-│   ├── db.py          # SQLite 表结构、状态机、有序 claim、熔断器状态机、批量事务写入、幂等查询
+│   ├── db.py          # SQLite 表结构、状态机、有序 claim、熔断器状态机、目标暂停开关、批量事务写入、幂等查询
 │   ├── delivery.py    # 出站 HTTP 投递与 HMAC 签名
 │   └── worker.py      # 后台调度器（每端点有序、跨端点线程池并行）
 ├── tests/             # 端到端测试

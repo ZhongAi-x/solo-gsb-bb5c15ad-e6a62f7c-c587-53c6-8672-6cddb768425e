@@ -31,6 +31,11 @@ class EventIn(BaseModel):
     expires_at: AwareDatetime | None = None
 
 
+class TargetPauseIn(BaseModel):
+    target: HttpUrl
+    paused: bool
+
+
 # In-memory counters for the built-in demo sink (not part of the core API).
 _sink_lock = threading.Lock()
 _sink_calls: dict[str, int] = {}
@@ -82,9 +87,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Reliable Webhook Delivery API",
-    version="1.4.0",
+    version="1.5.0",
     description="Sign, enqueue, reliably deliver, replay and inspect webhook events, "
-    "with persistent per-target circuit breakers.",
+    "with persistent per-target circuit breakers and maintenance pauses.",
     lifespan=lifespan,
 )
 
@@ -339,6 +344,50 @@ async def get_target_breakers(
     """
     breakers = db.list_breakers(state=state, target=target, limit=limit, offset=offset)
     return {"breakers": breakers, "limit": limit, "offset": offset}
+
+
+@app.put("/targets/pause")
+async def set_target_pause(pause_in: TargetPauseIn):
+    """Pause or resume delivery to one target (maintenance switch).
+
+    The request body is ``{"target": <url>, "paused": <bool>}``. The target
+    URL is normalised with exactly the same rule as event ingestion
+    (``str(HttpUrl)``), so it matches stored targets precisely. Setting the
+    same flag repeatedly is idempotent — an identical request changes
+    nothing but ``updated_at``.
+
+    The flag write and the scheduler's claim step are serialised through the
+    same database lock and run in single transactions: after a pause commits,
+    no further event for the target is claimed; an event already claimed
+    (``processing``) is not interrupted and its request completes normally;
+    other targets are delivered as usual. Queued events of a paused target
+    keep expiring on their ``expires_at`` deadline. Resuming clears only the
+    pause flag — head-of-queue order, scheduled times, backoff and breaker
+    state (open deadline, failure count, half-open probe) all remain in
+    effect and no attempt counter is reset. The flag persists in SQLite and
+    survives restarts.
+    """
+    row = db.set_target_pause(str(pause_in.target), pause_in.paused)
+    return row
+
+
+@app.get("/targets/pauses")
+async def get_target_pauses(
+    target: str | None = Query(None, description="Filter by exact target URL."),
+    paused: bool | None = Query(None, description="Only return paused/unpaused rows."),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """Report every target whose maintenance switch has been set.
+
+    Each row carries the exact (normalised) target URL, the current
+    ``paused`` flag and the last change time ``updated_at`` (RFC 3339 UTC).
+    Targets that were never configured do not appear and behave as unpaused.
+    """
+    rows = db.list_target_pauses(
+        target=target, paused=paused, limit=limit, offset=offset
+    )
+    return {"pauses": rows, "limit": limit, "offset": offset}
 
 
 @app.get("/health")
